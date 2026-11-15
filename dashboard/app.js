@@ -104,6 +104,8 @@
   }
 
   function readHash() {
+    state.q = ''; state.category = 'all'; state.chain = 'all'; state.tab = 'pre-token';
+    state.watch = false; state.early = false; state.selected = null;
     var hash = window.location.hash.replace(/^#/, '');
     if (!hash) return;
     var params = new URLSearchParams(hash);
@@ -255,7 +257,7 @@
             sortHeader('implied', 'Rank'), sortHeader('name', 'Protocol'), sortHeader('tvl', 'TVL'),
             sortHeader('growth', '7d'), sortHeader('age', 'Age'), sortHeader('mult', 'Multiple'),
             sortHeader('implied', 'Implied value'), el('th', { scope: 'col', text: 'Board' }))),
-          tbody))));
+          tbody)));
   }
 
   function liveTable() {
@@ -358,5 +360,6 @@
 
   readHash();
   render();
+  window.addEventListener('hashchange', function () { readHash(); render(); });
   window.addEventListener('keydown', function (e) { if (e.key === 'Escape' && dialog.open) dialog.close(); });
 })();
