@@ -92,6 +92,10 @@ export interface Classifier {
   base_rate_pct: number;
   folds: number;
   weights: number[];
+  /** Median TVL per category, from the training rows: the odds feature's reference. */
+  cat_median: Record<string, number>;
+  /** Shrunk token rate per category, from the training rows: the odds feature's prior. */
+  cat_rate: Record<string, number>;
 }
 
 /** One set-aside bucket: the protocols the board does not rank, and why. */
@@ -158,7 +162,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -595,12 +599,55 @@ export function validateCurve(snapshot: Snapshot, model: ModelConstants = MODEL)
   };
 }
 
-/** The launch-odds features: log TVL, clipped 7-day growth, log age, chain count. */
-function oddsFeatures(p: SnapshotProtocol, asOf: string): number[] {
+/** Category stats a launch-odds feature needs: the median TVL of the category
+ * and the share of the category's protocols that already carry a token,
+ * shrunk toward the global token rate (4 pseudo-protocols). Both are computed
+ * from the training rows only, so a held-out fold never feeds its own features. */
+export interface CategoryStats {
+  median: Map<string, number>;
+  rate: Map<string, number>;
+}
+
+function categoryStats(rows: SnapshotProtocol[]): CategoryStats {
+  const tvls = new Map<string, number[]>();
+  const tok = new Map<string, { n: number; tok: number }>();
+  let globTok = 0;
+  for (const p of rows) {
+    const cat = p.category ?? '';
+    const a = tvls.get(cat) ?? [];
+    a.push(p.tvl_usd);
+    tvls.set(cat, a);
+    const t = tok.get(cat) ?? { n: 0, tok: 0 };
+    t.n++;
+    if (hasToken(p)) t.tok++;
+    tok.set(cat, t);
+    if (hasToken(p)) globTok++;
+  }
+  const glob = rows.length > 0 ? globTok / rows.length : 0;
+  const median = new Map<string, number>();
+  for (const [cat, a] of tvls) {
+    const s = [...a].sort((x, y) => x - y);
+    median.set(cat, s[Math.floor(s.length / 2)]!);
+  }
+  const rate = new Map<string, number>();
+  for (const [cat, t] of tok) rate.set(cat, ((t.tok + 4 * glob) / (t.n + 4) - glob) * 4);
+  return { median, rate };
+}
+
+/** The launch-odds features: log TVL, clipped 7-day growth, log age, chain
+ * count, log TVL relative to the category median (a big fish in a small pond
+ * launches more often), and the category's token rate, shrunk toward the
+ * global rate (categories where tokens are the norm launch more often).
+ * Every feature is a function of the snapshot row and its category's
+ * training-set stats; nothing names a protocol. */
+function oddsFeatures(p: SnapshotProtocol, asOf: string, stats: CategoryStats): number[] {
   const age = ageDays(asOf, p.listed_at);
   const logAge = Math.log10(Math.max(age ?? 365, 1));
   const growth = Math.min(60, Math.max(-50, finite(p.change_7d, 0)));
-  return [1, (Math.log10(Math.max(p.tvl_usd, 1)) - 8) / 1.5, growth / 25, (logAge - 2.5) / 0.8, (p.chains.length - 1) / 3];
+  const cat = p.category ?? '';
+  const rel = Math.log10(Math.max(p.tvl_usd, 1) / Math.max(stats.median.get(cat) ?? p.tvl_usd, 1));
+  const rate = stats.rate.get(cat) ?? 0;
+  return [1, (Math.log10(Math.max(p.tvl_usd, 1)) - 8) / 1.5, growth / 25, (logAge - 2.5) / 0.8, (p.chains.length - 1) / 3, rel, rate];
 }
 
 /** Whether a protocol's record carries a token in any form. */
@@ -613,26 +660,28 @@ function sigmoid(z: number): number {
   return 1 / (1 + Math.exp(-c));
 }
 
-/** Logistic regression by plain gradient descent: fixed iterations, fixed rate, deterministic. */
-function trainLogistic(rows: SnapshotProtocol[], asOf: string, iters = 400, lr = 0.15): number[] {
-  const xs = rows.map((p) => oddsFeatures(p, asOf));
+/** Logistic regression by plain gradient descent: fixed iterations, fixed rate, deterministic.
+ * The category stats come from the same rows, so a held-out fold's stats never see the fold. */
+function trainLogistic(rows: SnapshotProtocol[], asOf: string, iters = 2000, lr = 0.15): { weights: number[]; stats: CategoryStats } {
+  const stats = categoryStats(rows);
+  const xs = rows.map((p) => oddsFeatures(p, asOf, stats));
   const ys = rows.map((p) => (hasToken(p) ? 1 : 0));
-  const w = [0, 0, 0, 0, 0];
+  const w = [0, 0, 0, 0, 0, 0, 0];
   for (let t = 0; t < iters; t++) {
-    const grad = [0, 0, 0, 0, 0];
+    const grad = [0, 0, 0, 0, 0, 0, 0];
     for (let i = 0; i < xs.length; i++) {
       const xi = xs[i]!;
       let z = 0;
-      for (let j = 0; j < 5; j++) z += w[j]! * xi[j]!;
+      for (let j = 0; j < 7; j++) z += w[j]! * xi[j]!;
       const pr = sigmoid(z);
-      for (let j = 0; j < 5; j++) grad[j]! += (pr - ys[i]!) * xi[j]!;
+      for (let j = 0; j < 7; j++) grad[j]! += (pr - ys[i]!) * xi[j]!;
     }
-    for (let j = 0; j < 5; j++) {
+    for (let j = 0; j < 7; j++) {
       grad[j] = grad[j]! / xs.length + 0.01 * w[j]!;
       w[j] = w[j]! - lr * grad[j]!;
     }
   }
-  return w;
+  return { weights: w, stats };
 }
 
 /** The classifier's held-out accuracy: 5 folds split by slug hash, against the base rate. */
@@ -651,32 +700,34 @@ export function trainOdds(snapshot: Snapshot, model: ModelConstants = MODEL): Cl
     const test = folds[k]!;
     const train: SnapshotProtocol[] = [];
     for (let j = 0; j < 5; j++) if (j !== k) train.push(...folds[j]!);
-    const w = trainLogistic(train, snapshot.as_of);
+    const { weights: w, stats } = trainLogistic(train, snapshot.as_of);
     let ones = 0;
     for (const p of test) {
-      const xi = oddsFeatures(p, snapshot.as_of);
+      const xi = oddsFeatures(p, snapshot.as_of, stats);
       let z = 0;
-      for (let j = 0; j < 5; j++) z += w[j]! * xi[j]!;
+      for (let j = 0; j < 7; j++) z += w[j]! * xi[j]!;
       if ((sigmoid(z) >= 0.5) === hasToken(p)) correct++;
       if (hasToken(p)) ones++;
     }
     baseCorrect += Math.max(ones, test.length - ones);
     total += test.length;
   }
-  const w = trainLogistic(rows, snapshot.as_of);
+  const { weights: w, stats } = trainLogistic(rows, snapshot.as_of);
   return {
     accuracy_pct: Math.round((correct / total) * 100) / 100,
     base_rate_pct: Math.round((baseCorrect / total) * 100) / 100,
     folds: 5,
     weights: w.map((x) => Math.round(x * 1e4) / 1e4),
+    cat_median: Object.fromEntries(stats.median),
+    cat_rate: Object.fromEntries(stats.rate),
   };
 }
 
 /** One protocol's launch odds from the trained classifier. */
-export function oddsFor(p: SnapshotProtocol, asOf: string, w: number[]): number {
-  const xi = oddsFeatures(p, asOf);
+export function oddsFor(p: SnapshotProtocol, asOf: string, w: number[], stats: CategoryStats): number {
+  const xi = oddsFeatures(p, asOf, stats);
   let z = 0;
-  for (let j = 0; j < 5; j++) z += w[j]! * xi[j]!;
+  for (let j = 0; j < 7; j++) z += w[j]! * xi[j]!;
   return Math.round(sigmoid(z) * 100) / 100;
 }
 
@@ -778,8 +829,10 @@ export function economicsFor(
   const net_usd = Math.round((payout_usd - gas_usd) * 100) / 100;
   const per_hour_usd = Math.round((net_usd / hours) * 100) / 100;
   const break_even_odds = Math.round(Math.min(9.99, gas_usd / Math.max(payout_usd, 0.01)) * 100) / 100;
+  // FARM also needs the launch odds to beat the break-even odds: a plan whose
+  // expected value is negative is not worth doing, however big its payout.
   const verdict: 'FARM' | 'MARGINAL' | 'SKIP' =
-    net_usd >= model.farm_net_threshold && per_hour_usd >= model.farm_per_hour_threshold ? 'FARM' : net_usd > 0 ? 'MARGINAL' : 'SKIP';
+    net_usd >= model.farm_net_threshold && per_hour_usd >= model.farm_per_hour_threshold && launchOdds >= break_even_odds ? 'FARM' : net_usd > 0 ? 'MARGINAL' : 'SKIP';
   return { farmers, payout_usd, gas_usd, hours, net_usd, per_hour_usd, break_even_odds, verdict };
 }
 
@@ -787,6 +840,10 @@ export function economicsFor(
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const curve = fitCurve(compsOf(snapshot), model);
   const classifier = trainOdds(snapshot, model);
+  const oddsStats: CategoryStats = {
+    median: new Map(Object.entries(classifier.cat_median)),
+    rate: new Map(Object.entries(classifier.cat_rate)),
+  };
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries.
@@ -836,8 +893,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   return scored.map((s, i) => {
     const iv = [...(impliedSamples.get(s.p.slug) ?? [s.implied])].sort((a, b) => a - b);
     const rk = [...(rankSamples.get(s.p.slug) ?? [i + 1])].sort((a, b) => a - b);
-    const odds = oddsFor(s.p, snapshot.as_of, classifier.weights);
-    const econ = economicsFor(s.implied, s.p.tvl_usd, odds, holdDaysFor(s.age), model);
+    const odds = oddsFor(s.p, snapshot.as_of, classifier.weights, oddsStats);
+    const hold = holdDaysFor(s.age);
+    const econ = economicsFor(s.implied, s.p.tvl_usd, odds, hold, model);
     return {
       rank: i + 1,
       slug: s.p.slug,
@@ -877,7 +935,15 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
         breadth_multiplier: round4(s.breadthMult),
         age_days: s.age,
       },
-      farm_steps: farmSteps(s.p, s.age, model.deposit_usd).map(stepText),
+      farm_steps: farmSteps(s.p, s.age, model.deposit_usd, {
+        hold_days: hold,
+        gas_usd: econ.gas_usd,
+        net_usd: econ.net_usd,
+        payout_usd: econ.payout_usd,
+        break_even_odds: econ.break_even_odds,
+        launch_odds: odds,
+        verdict: econ.verdict,
+      }).map(stepText),
     };
   });
 }
@@ -916,54 +982,71 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
-/** The category's weekly qualifying action. */
+/** The category's weekly qualifying action, as a clause the plan completes with the protocol's name. */
 function weeklyFor(p: SnapshotProtocol): string {
   const c = (p.category ?? '').toLowerCase();
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return 'Make one qualifying action each week: a fresh supply, a small borrow and repay, or a vote in its governance.';
-  if (c.includes('dex') || c.includes('leveraged farm')) return 'Make one qualifying action each week: a $10 swap through its main pool, or add and remove a little liquidity.';
-  if (c.includes('perpetual') || c.includes('derivative') || c.includes('basis')) return 'Make one qualifying action each week: open and close one small hedged trade, never a naked leveraged bet.';
-  if (c.includes('prediction')) return 'Make one qualifying action each week: place one small position on a market that settles soon.';
-  if (c.includes('bridge')) return 'Make one qualifying action each week: bridge a small amount and use it once on the destination chain.';
-  if (c.includes('staking') || c.includes('restak')) return 'Make one qualifying action each week: top up the stake a little, or claim and restake the rewards.';
-  return 'Make one qualifying action each week: a deposit, a swap, a vote, or a claim inside the protocol itself.';
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return 'a fresh supply, a small borrow and repay, or a vote in its governance';
+  if (c.includes('dex') || c.includes('leveraged farm')) return 'a $10 swap through its main pool, or add and remove a little liquidity';
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('basis')) return 'open and close one small hedged trade, never a naked leveraged bet';
+  if (c.includes('prediction')) return 'one small position on a market that settles soon';
+  if (c.includes('bridge')) return 'bridge a small amount and use it once on the destination chain';
+  if (c.includes('staking') || c.includes('restak')) return 'top up the stake a little, or claim and restake the rewards';
+  return 'a deposit, a swap, a vote, or a claim inside the protocol itself';
+}
+
+/** The economics a farm plan's steps quote: the hold, the gas, the net and the verdict. */
+export interface FarmPlanEcon {
+  hold_days: number;
+  gas_usd: number;
+  net_usd: number;
+  payout_usd: number;
+  break_even_odds: number;
+  launch_odds: number;
+  verdict: 'FARM' | 'MARGINAL' | 'SKIP';
 }
 
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan
  * is derived from the protocol's own record (category, chains, TVL, age), never from a
- * hand-written list of names. The deposit is the plan's capital: the economics the
- * page nets are the same deposit.
+ * hand-written list of names — and every step now names the protocol, its chain, or the
+ * plan's own numbers, so no two protocols' plans read the same. The deposit is the
+ * plan's capital: the economics the page nets are the same deposit. If the token never
+ * launches, the deposit is still the farmer's; the loss is the gas and fees.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null, deposit = MODEL.deposit_usd): FarmStep[] {
+export function farmSteps(p: SnapshotProtocol, age: number | null, deposit = MODEL.deposit_usd, econ?: FarmPlanEcon): FarmStep[] {
   const chain = chainOf(p);
-  const hold = holdDaysFor(age);
+  const name = p.name;
+  const hold = econ?.hold_days ?? holdDaysFor(age);
   const action = actionFor(p, deposit, chain);
   const weekly = weeklyFor(p);
+  const oddsLine = econ
+    ? ` At ${Math.round(econ.launch_odds * 100)}% launch odds against a ${Math.round(econ.break_even_odds * 100)}% break-even, the plan nets $${Math.round(econ.net_usd).toLocaleString('en-US')} if it launches — verdict ${econ.verdict}.`
+    : '';
   return [
     {
-      text: `Open the protocol's own site from its DefiLlama listing, connect a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
+      text: `Open ${name}'s own site from its DefiLlama listing, connect a fresh wallet on ${chain} that holds only the funds you plan to farm, and keep its seed phrase offline.`,
       cost: 'under $3 of gas for the first transaction',
       time: '10 minutes',
     },
     { text: action, cost: `$${deposit} of capital and about $8 of gas`, time: '15 minutes to set up' },
-    { text: weekly, cost: 'about $2 of gas a week', time: '10 minutes a week' },
+    { text: `Make one qualifying action each week inside ${name}: ${weekly}.`, cost: 'about $2 of gas a week', time: '10 minutes a week' },
     {
-      text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot, and never withdraw and re-deposit just to look active.`,
+      text: `Hold the ${name} position for at least ${hold} days so the activity is counted in more than one snapshot, and never withdraw and re-deposit just to look active.`,
       cost: `the $${deposit} stays in the position`,
       time: `${hold} days`,
     },
     {
-      text: `Once a month, open the protocol's own points or rewards page and check the position is counted; only follow links the protocol itself publishes.`,
+      text: `Once a month, open ${name}'s points or rewards page and check the position is counted and the points are still growing; only follow links ${name} itself publishes.`,
       cost: 'no fee to check',
       time: '10 minutes a month',
     },
     {
-      text: `Never pay to claim anything, never paste your seed phrase anywhere, and ignore any direct message offering an early token sale.`,
+      text: `Never pay to claim a ${name} token, never paste your seed phrase anywhere, and ignore any direct message offering an early ${name} token sale.`,
       cost: '$0, and it saves the whole position',
       time: '2 minutes to read',
     },
     {
-      text: `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it in one sitting.`,
+      text: `Write it down: ${name} on ${chain}, $${deposit} in, a ${hold}-day hold.${oddsLine}${econ ? ` If it never launches, the deposit is still yours; the loss is the $${Math.round(econ.gas_usd).toLocaleString('en-US')} of gas and fees.` : ''}`,
       cost: 'nothing but the log',
       time: '5 minutes',
     },

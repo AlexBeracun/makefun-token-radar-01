@@ -1,4 +1,4 @@
-// Token Radar v3 entry (Node 22, standard library only).
+// Token Radar v4 entry (Node 22, standard library only).
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
 // scores every rankable pre-token protocol with the fitted size curve in

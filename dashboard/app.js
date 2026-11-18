@@ -1,16 +1,18 @@
-// Token Radar v3 — a static dashboard over the sealed snapshot (as_of 2026-11-14).
+// Token Radar v4 — a static dashboard over the sealed snapshot (as_of 2026-11-14).
 // No framework, no network: every number below is computed in lib/model.ts
 // from the snapshot and shipped in data.js. The page never invents data.
 //
-// What changed from v2: the value model is a fitted size curve, not a flat
-// category median. log10(mcap) = a + b * log10(TVL) is fitted on 128 traded
-// comps, with a shrunk category premium per category. The page shows the
-// fit, its blind tests, and the uncertainty of every row (P25-P75 implied
-// value and P10-P90 rank range from 200 seeded refits). Farm plans are
-// netted to the dollar: a $1,000 deposit, a 7% drop share split over
-// farmers, gas and hours subtracted, and a FARM / MARGINAL / SKIP verdict.
-// The deposit and drop-share selectors scale the economics live; the plan
-// steps themselves are written for the $1,000 deposit.
+// What changed from v3: the launch-odds classifier gained two features —
+// log TVL relative to the category median, and the category's token rate
+// (shrunk toward the global rate). Both are computed from the training rows
+// only, so a held-out fold never feeds its own features. Held-out accuracy
+// rose from 62% to 64% against a 57% base rate. The value curve is unchanged
+// (richer fits were tested and did not beat it on leave-one-out). Farm plans
+// are now written for the protocol: every step names it, its chain, or the
+// plan's own net, odds and verdict, and the last step states what the loss is
+// if the token never launches (the gas and fees — the deposit stays yours).
+// The FARM verdict now also requires launch odds ≥ break-even odds, so a FARM
+// row is worth doing in expectation, not just big on paper.
 
 const DATA = window.RADAR;
 
@@ -65,7 +67,7 @@ function econ(r) {
   const payout = r.payout_usd * (state.deposit / 1000) * (state.share / 0.07);
   const net = payout - r.gas_usd;
   const perHour = net / r.hours;
-  const verdict = net >= 25 && perHour >= 5 ? 'FARM' : net > 0 ? 'MARGINAL' : 'SKIP';
+  const verdict = net >= 25 && perHour >= 5 && r.launch_odds >= r.gas_usd / payout ? 'FARM' : net > 0 ? 'MARGINAL' : 'SKIP';
   return { payout, net, perHour, breakEven: r.gas_usd / payout, verdict };
 }
 
@@ -207,9 +209,9 @@ function methodPanel() {
       <tr><td>Leave-one-out, ${DATA.curve.comps} comps</td><td>median miss ×${v.loo.curve_median_miss} · ${Math.round(v.loo.curve_within_3x * 100)}% within 3× · Spearman ${v.loo.spearman}</td><td>median miss ×${v.loo.flat_median_miss} · ${Math.round(v.loo.flat_within_3x * 100)}% within 3× · Spearman ${v.loo.flat_spearman}</td><td>Each comp is priced by a curve fitted without it. The curve misses by less than the flat multiple on every measure.</td></tr>
       <tr><td>Walk-forward (fit 47 older, test 48 newer by listed date)</td><td>median miss ×${v.walk_forward.curve_median_miss} · ${Math.round(v.walk_forward.curve_within_3x * 100)}% within 3×</td><td>median miss ×${v.walk_forward.flat_median_miss} · ${Math.round(v.walk_forward.flat_within_3x * 100)}% within 3×</td><td>The curve was fitted on older launches and tested on newer ones — the same direction a radar is actually used.</td></tr>
       <tr><td>Predictive value bands</td><td>${Math.round(v.range_holds_pct * 100)}% of comps' true market caps land inside their P10–P90 band</td><td>—</td><td>200 seeded refits of the curve; each draw adds one residual of noise, so the band is the interval a fresh protocol's true value should land in. It is honest if comps fall inside it about 80% of the time.</td></tr>
-      <tr><td>Launch odds (will it ever list a token?)</td><td>${Math.round(c.accuracy_pct * 100)}% held-out accuracy</td><td>${Math.round(c.base_rate_pct * 100)}% base rate</td><td>Logistic classifier on log TVL, clipped 7d growth, log age and chain count, 5-fold cross-validated. Better than guessing, far from certain — treat odds as a ranking aid, not a forecast.</td></tr>
+      <tr><td>Launch odds (will it ever list a token?)</td><td>${Math.round(c.accuracy_pct * 100)}% held-out accuracy</td><td>${Math.round(c.base_rate_pct * 100)}% base rate</td><td>Logistic classifier on log TVL, clipped 7d growth, log age, chain count, TVL relative to the category median, and the category's token rate (shrunk toward the global rate), 5-fold cross-validated. Better than guessing, far from certain — treat odds as a ranking aid, not a forecast.</td></tr>
     </tbody></table>
-    <p><strong>Farm economics, netted to the dollar.</strong> Deposit ${fmtUsd(state.deposit)}, drop share ${Math.round(state.share * 100)}% of the implied value, split over farmers = max(20,000, TVL / $25,000). Gas is $3 to enter + $8 to exit + $2 a week over the hold. Hours are the steps below. Net = payout − gas. Verdict: <strong>FARM</strong> if net ≥ $25 and net/hour ≥ $5, <strong>MARGINAL</strong> if net &gt; $0, otherwise <strong>SKIP</strong>. At the $1,000 / 7% defaults, ${DATA.farm_count} of ${DATA.rows.length} rows are FARM. Change the deposit or the drop share above and every net, verdict and count on this page updates.</p>
+    <p><strong>Farm economics, netted to the dollar.</strong> Deposit ${fmtUsd(state.deposit)}, drop share ${Math.round(state.share * 100)}% of the implied value, split over farmers = max(20,000, TVL / $25,000). Gas is $3 to enter + $8 to exit + $2 a week over the hold. Hours are the steps below. Net = payout − gas. Verdict: <strong>FARM</strong> if net ≥ $25, net/hour ≥ $5, and launch odds ≥ break-even odds, <strong>MARGINAL</strong> if net &gt; $0, otherwise <strong>SKIP</strong>. At the $1,000 / 7% defaults, ${DATA.farm_count} of ${DATA.rows.length} rows are FARM. Change the deposit or the drop share above and every net, verdict and count on this page updates.</p>
     <p><strong>Coverage.</strong> ${DATA.composition.ranked} protocols are ranked (the ${DATA.watchlist_size} watchlist protocols plus ${DATA.composition.early} early protocols below the $50M floor). The other ${setAsideTotal} protocols in the snapshot are set aside: ${DATA.composition.set_aside.map((s) => `${esc(s.reason)} ${s.count}`).join(', ')}. Every protocol in the snapshot is accounted for: ${DATA.composition.ranked} + ${setAsideTotal} = ${DATA.composition.total}.</p>
     <p class="limits"><strong>Limits.</strong> The snapshot is sealed at ${DATA.as_of}; nothing here is live data. Implied values are model estimates with a typical miss of ×${DATA.validation.loo.curve_median_miss} — a row at $100M could plausibly be worth $25M or $400M. Launch odds come from the same snapshot, not from news or team quality. Farm plans assume the token launches and the drop happens; they do not price smart-contract risk or the time a launch takes.</p>
   </section>`;
@@ -293,7 +295,7 @@ function detailDialog() {
         </tbody></table>
         <h3>Launch odds</h3>
         <div class="oddsbar"><div style="width:${Math.round(r.launch_odds * 100)}%"></div></div>
-        <p class="muted">${fmtOdds(r.launch_odds)} chance this protocol ever lists a token, from the classifier (log TVL, 7d growth, age, chain count). ${Math.round(DATA.classifier.accuracy_pct * 100)}% held-out accuracy vs a ${Math.round(DATA.classifier.base_rate_pct * 100)}% base rate — a ranking aid, not a forecast.</p>
+        <p class="muted">${fmtOdds(r.launch_odds)} chance this protocol ever lists a token, from the classifier (log TVL, 7d growth, age, chain count, TVL vs its category median, category token rate). ${Math.round(DATA.classifier.accuracy_pct * 100)}% held-out accuracy vs a ${Math.round(DATA.classifier.base_rate_pct * 100)}% base rate — a ranking aid, not a forecast.</p>
       </div>
       <div>
         <h3>Farm plan — netted at ${fmtUsd(state.deposit)} · ${Math.round(state.share * 100)}% drop share</h3>
