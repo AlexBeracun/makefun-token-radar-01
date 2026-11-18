@@ -1,7 +1,7 @@
-// Token Radar v2 entry (Node 22, standard library only).
+// Token Radar v3 entry (Node 22, standard library only).
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
-// scores every rankable pre-token protocol with the calibrated model in
+// scores every rankable pre-token protocol with the fitted size curve in
 // lib/model.ts, writes the ranked board to /output/board.json, writes the
 // dashboard's data to /output/data.js, copies dashboard/ and screenshots/ to
 // /output, and writes /output/dossier.json with the vendored make.fun library.
@@ -85,7 +85,11 @@ for (const name of shots) {
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
+const v = radar.validation;
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside), ${radar.farm_count} FARM verdicts\n` +
+    `token radar: curve log10(mcap) = ${radar.curve.intercept} + ${radar.curve.slope} * log10(tvl) over ${radar.curve.comps} comps\n` +
+    `token radar: LOO median miss x${v.loo.curve_median_miss} (${Math.round(v.loo.curve_within_3x * 100)}% within 3x, spearman ${v.loo.spearman}) vs flat x${v.loo.flat_median_miss} (${Math.round(v.loo.flat_within_3x * 100)}% within 3x)\n` +
+    `token radar: walk-forward median miss x${v.walk_forward.curve_median_miss} (${Math.round(v.walk_forward.curve_within_3x * 100)}% within 3x) vs flat x${v.walk_forward.flat_median_miss}; range holds ${Math.round(v.range_holds_pct * 100)}%; launch odds ${Math.round(radar.classifier.accuracy_pct * 100)}% vs base ${Math.round(radar.classifier.base_rate_pct * 100)}%\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
