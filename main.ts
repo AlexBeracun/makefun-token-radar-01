@@ -1,4 +1,10 @@
-// Token Radar v4 entry (Node 22, standard library only).
+// Token Radar v5 entry (Node 22, standard library only).
+// v5 changes only the launch-odds classifier: age enters in years (not
+// log-years — the token rate rises about linearly with age in this snapshot)
+// plus whether Ethereum is the protocol's first-listed chain. Held-out
+// accuracy 64% → 68% on the same 5-fold protocol; the value curve is
+// unchanged (richer fits, comp-set cleaning and shrink sweeps were tested on
+// the same leave-one-out / walk-forward protocol and did not beat it).
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
 // scores every rankable pre-token protocol with the fitted size curve in

@@ -24,7 +24,7 @@
 // correlation), a walk-forward split by listing date, the same two tests for a
 // flat median multiple, and 200 seeded bootstrap refits that give every row a
 // P25-P75 implied-value band and a P10-P90 rank range. Launch odds come from a
-// small logistic classifier (log TVL, 7-day growth, log age, chain count)
+// small logistic classifier (log TVL, 7-day growth, age in years, chain count)
 // trained on all 758 protocols to predict whether a protocol records a token,
 // scored by 5-fold cross-validation against the base rate.
 //
@@ -162,7 +162,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-4';
+export const MODEL_VERSION = 'radar-5';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -634,20 +634,26 @@ function categoryStats(rows: SnapshotProtocol[]): CategoryStats {
   return { median, rate };
 }
 
-/** The launch-odds features: log TVL, clipped 7-day growth, log age, chain
- * count, log TVL relative to the category median (a big fish in a small pond
- * launches more often), and the category's token rate, shrunk toward the
- * global rate (categories where tokens are the norm launch more often).
- * Every feature is a function of the snapshot row and its category's
- * training-set stats; nothing names a protocol. */
+/** The launch-odds features: log TVL, clipped 7-day growth, age in years,
+ * chain count, log TVL relative to the category median (a big fish in a small
+ * pond launches more often), the category's token rate, shrunk toward the
+ * global rate (categories where tokens are the norm launch more often), and
+ * whether Ethereum is the protocol's first-listed chain (in this snapshot
+ * 63% of Ethereum-first protocols already carry a token, against 50% of the
+ * rest). Age enters in years, not log-years: the share already carrying a
+ * token rises about linearly with age (33% under a year old, 79% past three
+ * years), so log-age compresses exactly the end that matters. Every feature
+ * is a function of the snapshot row and its category's training-set stats;
+ * nothing names a protocol. */
 function oddsFeatures(p: SnapshotProtocol, asOf: string, stats: CategoryStats): number[] {
   const age = ageDays(asOf, p.listed_at);
-  const logAge = Math.log10(Math.max(age ?? 365, 1));
+  const ageYears = (age ?? 365) / 365;
   const growth = Math.min(60, Math.max(-50, finite(p.change_7d, 0)));
   const cat = p.category ?? '';
   const rel = Math.log10(Math.max(p.tvl_usd, 1) / Math.max(stats.median.get(cat) ?? p.tvl_usd, 1));
   const rate = stats.rate.get(cat) ?? 0;
-  return [1, (Math.log10(Math.max(p.tvl_usd, 1)) - 8) / 1.5, growth / 25, (logAge - 2.5) / 0.8, (p.chains.length - 1) / 3, rel, rate];
+  const ethFirst = p.chains.length > 0 && p.chains[0] === 'Ethereum' ? 1 : 0;
+  return [1, (Math.log10(Math.max(p.tvl_usd, 1)) - 8) / 1.5, growth / 25, ageYears - 1, (p.chains.length - 1) / 3, rel, rate, ethFirst];
 }
 
 /** Whether a protocol's record carries a token in any form. */
@@ -666,17 +672,17 @@ function trainLogistic(rows: SnapshotProtocol[], asOf: string, iters = 2000, lr 
   const stats = categoryStats(rows);
   const xs = rows.map((p) => oddsFeatures(p, asOf, stats));
   const ys = rows.map((p) => (hasToken(p) ? 1 : 0));
-  const w = [0, 0, 0, 0, 0, 0, 0];
+  const w = [0, 0, 0, 0, 0, 0, 0, 0];
   for (let t = 0; t < iters; t++) {
-    const grad = [0, 0, 0, 0, 0, 0, 0];
+    const grad = [0, 0, 0, 0, 0, 0, 0, 0];
     for (let i = 0; i < xs.length; i++) {
       const xi = xs[i]!;
       let z = 0;
-      for (let j = 0; j < 7; j++) z += w[j]! * xi[j]!;
+      for (let j = 0; j < 8; j++) z += w[j]! * xi[j]!;
       const pr = sigmoid(z);
-      for (let j = 0; j < 7; j++) grad[j]! += (pr - ys[i]!) * xi[j]!;
+      for (let j = 0; j < 8; j++) grad[j]! += (pr - ys[i]!) * xi[j]!;
     }
-    for (let j = 0; j < 7; j++) {
+    for (let j = 0; j < 8; j++) {
       grad[j] = grad[j]! / xs.length + 0.01 * w[j]!;
       w[j] = w[j]! - lr * grad[j]!;
     }
@@ -705,7 +711,7 @@ export function trainOdds(snapshot: Snapshot, model: ModelConstants = MODEL): Cl
     for (const p of test) {
       const xi = oddsFeatures(p, snapshot.as_of, stats);
       let z = 0;
-      for (let j = 0; j < 7; j++) z += w[j]! * xi[j]!;
+      for (let j = 0; j < 8; j++) z += w[j]! * xi[j]!;
       if ((sigmoid(z) >= 0.5) === hasToken(p)) correct++;
       if (hasToken(p)) ones++;
     }
@@ -727,7 +733,7 @@ export function trainOdds(snapshot: Snapshot, model: ModelConstants = MODEL): Cl
 export function oddsFor(p: SnapshotProtocol, asOf: string, w: number[], stats: CategoryStats): number {
   const xi = oddsFeatures(p, asOf, stats);
   let z = 0;
-  for (let j = 0; j < 7; j++) z += w[j]! * xi[j]!;
+  for (let j = 0; j < 8; j++) z += w[j]! * xi[j]!;
   return Math.round(sigmoid(z) * 100) / 100;
 }
 
