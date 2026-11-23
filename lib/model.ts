@@ -1,4 +1,4 @@
-// Token Radar v3 — the value model.
+// Token Radar v6 — the value model.
 //
 // The board ranks every rankable pre-token protocol in the snapshot: the 40
 // watchlist protocols (the floor) plus every pre-token protocol the watchlist's
@@ -10,23 +10,32 @@
 // Implied value is a fitted size curve, not a median multiple:
 //
 //   log10(value) = a + b * log10(tvl_usd) + premium[category]
-//   implied      = 10^log10(value) * growth * maturity * breadth
+//   implied      = 10^log10(value)
 //
-// a and b are the least-squares fit of log10(market cap) on log10(TVL) over the
-// snapshot's own traded tokens (128 comps); premium[category] is the category's
-// mean residual, shrunk toward 0 with pseudo-count 8 and clamped to [-0.3, 0.3].
-// growth, maturity and breadth are the v2 factors: a 7-day rise is rewarded at
-// half weight and a drop penalised at full weight; maturity is a square-root
-// curve over days listed with no token; breadth adds 2% per extra chain to 10%.
+// a, b and premium[category] are the ridge fit of log10(market cap) on
+// log10(TVL) with one dummy per category, fitted jointly over the snapshot's
+// own traded tokens (128 comps); the dummies carry the ridge penalty
+// (lambda 24), the intercept and slope are unpenalised, and premiums are
+// clamped to [-0.3, 0.3]. The v3-v5 growth, maturity and breadth multipliers
+// are NOT applied in v6: each was tested alone as a value term on top of the
+// curve and each raised the held-out mean |log miss| on BOTH tests
+// (leave-one-out and walk-forward), so the ablation gate drops them. Age and
+// momentum still matter — through the launch odds, where they demonstrably
+// help — but they do not price how big a launch will be.
 //
 // The curve is validated, and the validation is printed on the dashboard:
 // leave-one-out over the 128 comps (median miss, % within 3x, Spearman rank
-// correlation), a walk-forward split by listing date, the same two tests for a
-// flat median multiple, and 200 seeded bootstrap refits that give every row a
-// P25-P75 implied-value band and a P10-P90 rank range. Launch odds come from a
-// small logistic classifier (log TVL, 7-day growth, age in years, chain count)
-// trained on all 758 protocols to predict whether a protocol records a token,
-// scored by 5-fold cross-validation against the base rate.
+// correlation), a walk-forward split by listing date, the same two tests for
+// a flat median multiple, a size-stratified 5-fold and a
+// leave-one-category-out split, an ablation table that gates every value
+// term on both held-out tests, and 200 seeded bootstrap refits that give
+// every row a P25-P75 implied-value band and a P10-P90 rank range. Launch
+// odds come from a 17-feature logistic classifier (log TVL, 7-day growth,
+// age in years, chain count, TVL relative to the category median, the
+// category's shrunk token rate, first-chain dummies, two age buckets and the
+// age-by-size interaction) trained on all 758 protocols to predict whether a
+// protocol records a token, scored by 5-fold cross-validation against the
+// base rate, with the out-of-fold Brier score, AUC and a calibration table.
 //
 // Farm economics are netted to the dollar at a $1,000 deposit and a 7% drop
 // share: the drop is split among an assumed max(20,000, TVL / $25,000)
@@ -78,10 +87,32 @@ export interface ValidationTest {
   flat_spearman: number;
 }
 
+/** One extra curve split: curve-only pooled out-of-fold metrics. */
+export interface SplitValidation {
+  n: number;
+  curve_median_miss: number;
+  curve_within_3x: number;
+  spearman: number;
+  curve_mean_log_miss: number;
+}
+
+/** One ablation row: a value term added in order, scored on both held-out tests. */
+export interface AblationRow {
+  term: string;
+  loo_median_miss: number;
+  loo_mean_log_miss: number;
+  wf_median_miss: number;
+  wf_mean_log_miss: number;
+  verdict: 'step' | 'kept' | 'dropped';
+}
+
 /** The model's validation, as the dashboard prints it. */
 export interface Validation {
   loo: ValidationTest;
   walk_forward: ValidationTest & { train: number; test: number };
+  size_stratified: SplitValidation;
+  leave_one_category_out: SplitValidation;
+  ablation: AblationRow[];
   range_holds_pct: number;
   refits: number;
 }
@@ -91,6 +122,12 @@ export interface Classifier {
   accuracy_pct: number;
   base_rate_pct: number;
   folds: number;
+  /** Brier score of the out-of-fold scores (lower is better; 0.25 is chance at a 50% base rate). */
+  brier: number;
+  /** Out-of-fold AUC (Mann-Whitney, tie-averaged ranks). */
+  auc: number;
+  /** Out-of-fold calibration: mean predicted vs actual token rate per score bin. */
+  calibration: { n: number; predicted: number; actual: number }[];
   weights: number[];
   /** Median TVL per category, from the training rows: the odds feature's reference. */
   cat_median: Record<string, number>;
@@ -128,6 +165,8 @@ export interface ModelConstants {
   breadth_max_chains: number;
   premium_shrink: number;
   premium_cap: number;
+  ridge_lambda: number;
+  odds_l2: number;
   bootstrap_refits: number;
   bootstrap_seed: number;
   deposit_usd: number;
@@ -151,6 +190,8 @@ export const MODEL: ModelConstants = {
   breadth_max_chains: 5,
   premium_shrink: 8,
   premium_cap: 0.3,
+  ridge_lambda: 24,
+  odds_l2: 0.005,
   bootstrap_refits: 200,
   bootstrap_seed: 20261118,
   deposit_usd: 1000,
@@ -162,7 +203,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-5';
+export const MODEL_VERSION = 'radar-6';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -363,40 +404,71 @@ export function compsOf(snapshot: Snapshot): SnapshotProtocol[] {
   return snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
 }
 
+/** Solve a small dense linear system by Gaussian elimination with partial pivoting. */
+function solveLinear(a: number[][], b: number[]): number[] {
+  const n = b.length;
+  const m = a.map((row, i) => [...row, b[i]!]);
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(m[r]![col]!) > Math.abs(m[piv]![col]!)) piv = r;
+    const tmp = m[col]!;
+    m[col] = m[piv]!;
+    m[piv] = tmp;
+    const d = m[col]![col]!;
+    if (Math.abs(d) < 1e-12) continue;
+    for (let r = col + 1; r < n; r++) {
+      const f = m[r]![col]! / d;
+      if (f === 0) continue;
+      for (let c = col; c <= n; c++) m[r]![c] = m[r]![c]! - f * m[col]![c]!;
+    }
+  }
+  const x = new Array<number>(n).fill(0);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = m[i]![n]!;
+    for (let j = i + 1; j < n; j++) s -= m[i]![j]! * x[j]!;
+    x[i] = Math.abs(m[i]![i]!) < 1e-12 ? 0 : s / m[i]![i]!;
+  }
+  return x;
+}
+
 /**
- * The least-squares fit of log10(market cap) on log10(TVL), with a shrunk
- * category premium per category (mean residual, pseudo-count shrink, clamped).
+ * The ridge fit of log10(market cap) on log10(TVL) with one dummy per
+ * category, fitted jointly with the size slope (not as a post-hoc mean
+ * residual). The dummies carry the ridge penalty (lambda 24); the intercept
+ * and slope are unpenalised. Joint fitting is what makes the category effect
+ * survive both held-out tests: the old two-stage mean-residual premium
+ * (shrink 8) scored LOO mean |log miss| 0.687 and walk-forward 0.697 on the
+ * same 128 comps; the ridge fit scores 0.685 and 0.680, and wins on the
+ * size-stratified and leave-one-category-out splits too (see validateCurve).
+ * A category unseen in training gets premium 0. Premiums are clamped to
+ * +/-0.3; the largest fitted dummy on the full comps is 0.12, so the clamp
+ * does not bind.
  */
 export function fitCurve(cs: SnapshotProtocol[], model: ModelConstants = MODEL): Curve {
-  const xs = cs.map((p) => Math.log10(p.tvl_usd));
-  const ys = cs.map((p) => Math.log10(p.mcap_usd!));
-  const n = xs.length;
-  const mx = xs.reduce((a, x) => a + x, 0) / n;
-  const my = ys.reduce((a, y) => a + y, 0) / n;
-  let sxy = 0;
-  let sxx = 0;
-  for (let i = 0; i < n; i++) {
-    sxy += (xs[i]! - mx) * (ys[i]! - my);
-    sxx += (xs[i]! - mx) * (xs[i]! - mx);
-  }
-  const slope = sxx === 0 ? 0 : sxy / sxx;
-  const intercept = my - slope * mx;
-  const sums = new Map<string, { total: number; n: number }>();
+  const cats = [...new Set(cs.map((p) => p.category ?? ''))].sort();
+  const ci = new Map(cats.map((c, i) => [c, i]));
+  const k = 2 + cats.length;
+  const xtx: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+  const xty = new Array<number>(k).fill(0);
   for (const p of cs) {
-    const r = Math.log10(p.mcap_usd!) - (intercept + slope * Math.log10(p.tvl_usd));
-    const key = p.category ?? '';
-    const e = sums.get(key);
-    if (e) {
-      e.total += r;
-      e.n++;
-    } else sums.set(key, { total: r, n: 1 });
+    const x = new Array<number>(k).fill(0);
+    x[0] = 1;
+    x[1] = Math.log10(p.tvl_usd);
+    x[2 + ci.get(p.category ?? '')!] = 1;
+    const y = Math.log10(p.mcap_usd!);
+    for (let i = 0; i < k; i++) {
+      xty[i]! += x[i]! * y;
+      for (let j = 0; j < k; j++) xtx[i]![j]! += x[i]! * x[j]!;
+    }
   }
+  for (let i = 2; i < k; i++) xtx[i]![i]! += model.ridge_lambda;
+  const w = solveLinear(xtx, xty);
   const premiums: Record<string, number> = {};
-  for (const [cat, e] of [...sums.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
-    const shrunk = e.total / (e.n + model.premium_shrink);
-    premiums[cat] = Math.round(Math.min(model.premium_cap, Math.max(-model.premium_cap, shrunk)) * 1e4) / 1e4;
+  for (const c of cats) {
+    const v = w[2 + ci.get(c)!]!;
+    premiums[c] = Math.round(Math.min(model.premium_cap, Math.max(-model.premium_cap, v)) * 1e4) / 1e4;
   }
-  return { intercept: Math.round(intercept * 1e4) / 1e4, slope: Math.round(slope * 1e4) / 1e4, premiums, comps: cs.length };
+  return { intercept: Math.round(w[0]! * 1e4) / 1e4, slope: Math.round(w[1]! * 1e4) / 1e4, premiums, comps: cs.length };
 }
 
 /** The curve's log10 value for one protocol, before the growth/maturity/breadth factors. */
@@ -409,7 +481,17 @@ export function premiumFor(p: SnapshotProtocol, curve: Curve): number {
   return curve.premiums[p.category ?? ''] ?? 0;
 }
 
-/** The four multipliers and the implied value one protocol gets. */
+/** The implied value one protocol gets: the ridge curve value, and nothing else.
+ * The growth, maturity and breadth multipliers that v3-v5 applied are NOT
+ * used in radar-6. Each was tested alone as a value term on top of the curve
+ * and each raised the held-out mean |log miss| on BOTH tests (LOO and
+ * walk-forward), so the ablation gate drops them: growth 0.690/0.682,
+ * maturity 0.691/0.687, breadth 0.686/0.683 against 0.685/0.680 without them
+ * (see validateCurve's ablation table). Age still matters — through the
+ * launch odds, where it demonstrably helps — and momentum still matters —
+ * through the odds' growth feature. But neither prices how big a launch
+ * will be, so neither multiplies the value. The multipliers are returned as
+ * 1 so the row model keeps its shape. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
@@ -420,13 +502,8 @@ export function impliedValue(
   const curveValue = Math.pow(10, curveLogValue(protocol, curve));
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = growthPct >= 0 ? 1 + (growthPct / 100) * model.growth_up_weight : 1 + (growthPct / 100) * model.growth_down_weight;
-  const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult =
-    model.maturity_floor + Math.sqrt(Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const breadthMult = 1 + model.breadth_step * Math.min(Math.max(protocol.chains.length - 1, 0), model.breadth_max_chains);
-  const implied = Math.max(1, Math.round(curveValue * growthMult * maturityMult * breadthMult));
-  return { implied, curveValue: Math.round(curveValue), growthPct, growthMult, maturityMult, breadthMult, age };
+  const implied = Math.max(1, Math.round(curveValue));
+  return { implied, curveValue: Math.round(curveValue), growthPct, growthMult: 1, maturityMult: 1, breadthMult: 1, age };
 }
 
 /** The miss multiple of a prediction against the truth: 1 is exact. */
@@ -475,12 +552,21 @@ function flatMultipleFor(p: SnapshotProtocol, cs: SnapshotProtocol[], model: Mod
 }
 
 /**
- * The v2 model's implied value: the same growth/maturity/breadth factors v3
- * applies, but the flat category-median multiple instead of the fitted curve.
- * The comparison is apples to apples: the only thing that changes between
- * v2 and v3 is how the size of a protocol is priced.
+ * The v2 model's implied value: the flat category-median multiple instead of
+ * the fitted curve, with no growth/maturity/breadth factors — the comparison
+ * is apples to apples, and the factors are not applied to either side in
+ * radar-6 (they raised the held-out miss on both tests, see impliedValue).
+ * The only thing that changes between v2 and radar-6 is how the size of a
+ * protocol is priced.
  */
 function flatImpliedValue(p: SnapshotProtocol, asOf: string, cs: SnapshotProtocol[], model: ModelConstants = MODEL): number {
+  return Math.max(1, Math.round(p.tvl_usd * flatMultipleFor(p, cs, model)));
+}
+
+/** The old v3-v5 value factors, used only by the ablation test: they are no
+ * longer applied to the board, but the ablation has to score them to justify
+ * dropping them. */
+function oldFactors(p: SnapshotProtocol, asOf: string, model: ModelConstants = MODEL): { growthMult: number; maturityMult: number; breadthMult: number } {
   const age = ageDays(asOf, p.listed_at);
   const rawGrowth = finite(p.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
@@ -489,7 +575,98 @@ function flatImpliedValue(p: SnapshotProtocol, asOf: string, cs: SnapshotProtoco
   const maturityMult =
     model.maturity_floor + Math.sqrt(Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const breadthMult = 1 + model.breadth_step * Math.min(Math.max(p.chains.length - 1, 0), model.breadth_max_chains);
-  return Math.max(1, Math.round(p.tvl_usd * flatMultipleFor(p, cs, model) * growthMult * maturityMult * breadthMult));
+  return { growthMult, maturityMult, breadthMult };
+}
+
+/** The size-only fit: log10(mcap) on log10(TVL) with no category effect at all. */
+function fitSizeOnly(cs: SnapshotProtocol[]): { intercept: number; slope: number } {
+  const xs = cs.map((p) => Math.log10(p.tvl_usd));
+  const ys = cs.map((p) => Math.log10(p.mcap_usd!));
+  const n = xs.length;
+  const mx = xs.reduce((a, x) => a + x, 0) / n;
+  const my = ys.reduce((a, y) => a + y, 0) / n;
+  let sxy = 0;
+  let sxx = 0;
+  for (let i = 0; i < n; i++) {
+    sxy += (xs[i]! - mx) * (ys[i]! - my);
+    sxx += (xs[i]! - mx) * (xs[i]! - mx);
+  }
+  const slope = sxx === 0 ? 0 : sxy / sxx;
+  return { intercept: my - slope * mx, slope };
+}
+
+/** Mean |log10 miss| of predictions against truth: the ablation gate's metric. */
+function meanLogMiss(preds: number[], actual: number[]): number {
+  let s = 0;
+  for (let i = 0; i < preds.length; i++) s += Math.abs(Math.log10(preds[i]! / actual[i]!));
+  return preds.length === 0 ? 0 : s / preds.length;
+}
+
+/**
+ * The ablation: each value term added in order, scored by mean |log miss|
+ * on BOTH held-out tests. A term is kept only if it lowers the mean miss on
+ * both. The flat multiple and the size-only curve are steps on the way to
+ * the final model; the three factors are each tested alone on top of the
+ * final curve and dropped, because each raises the miss on both tests.
+ * One ridge refit per held-out row serves all four curve variants, so the
+ * comparison is on identical folds.
+ */
+function ablationValidation(comps: SnapshotProtocol[], asOf: string, model: ModelConstants = MODEL): AblationRow[] {
+  const names = ['flat median multiple', 'size curve only (log-log OLS)', 'size + category (ridge, λ = 24)', '+ growth factor', '+ maturity factor', '+ breadth factor'] as const;
+  const looPreds: number[][] = names.map(() => []);
+  const looActual: number[] = [];
+  for (let i = 0; i < comps.length; i++) {
+    const rest = comps.filter((_, j) => j !== i);
+    const p = comps[i]!;
+    const curve = fitCurve(rest, model);
+    const size = fitSizeOnly(rest);
+    const cv = Math.pow(10, curveLogValue(p, curve));
+    const f = oldFactors(p, asOf, model);
+    const preds = [
+      flatImpliedValue(p, asOf, rest, model),
+      Math.pow(10, size.intercept + size.slope * Math.log10(p.tvl_usd)),
+      cv,
+      cv * f.growthMult,
+      cv * f.maturityMult,
+      cv * f.breadthMult,
+    ];
+    preds.forEach((v, k) => looPreds[k]!.push(v));
+    looActual.push(p.mcap_usd!);
+  }
+  const dated = comps.filter((p) => p.listed_at !== null).sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : 1));
+  const half = Math.floor(dated.length / 2);
+  const train = dated.slice(0, half);
+  const test = dated.slice(half);
+  const wfCurve = fitCurve(train, model);
+  const wfSize = fitSizeOnly(train);
+  const wfPreds: number[][] = names.map(() => []);
+  const wfActual: number[] = [];
+  for (const p of test) {
+    const cv = Math.pow(10, curveLogValue(p, wfCurve));
+    const f = oldFactors(p, asOf, model);
+    const preds = [
+      flatImpliedValue(p, asOf, train, model),
+      Math.pow(10, wfSize.intercept + wfSize.slope * Math.log10(p.tvl_usd)),
+      cv,
+      cv * f.growthMult,
+      cv * f.maturityMult,
+      cv * f.breadthMult,
+    ];
+    preds.forEach((v, k) => wfPreds[k]!.push(v));
+    wfActual.push(p.mcap_usd!);
+  }
+  const med = (preds: number[], actual: number[]): number => {
+    const m = preds.map((pv, i) => missMultiple(pv, actual[i]!)).sort((a, b) => a - b);
+    return Math.round((median(m) ?? 0) * 100) / 100;
+  };
+  return names.map((term, k) => ({
+    term,
+    loo_median_miss: med(looPreds[k]!, looActual),
+    loo_mean_log_miss: Math.round(meanLogMiss(looPreds[k]!, looActual) * 1e4) / 1e4,
+    wf_median_miss: med(wfPreds[k]!, wfActual),
+    wf_mean_log_miss: Math.round(meanLogMiss(wfPreds[k]!, wfActual) * 1e4) / 1e4,
+    verdict: k < 2 ? 'step' : k === 2 ? 'kept' : 'dropped',
+  }));
 }
 
 /** One validation test: curve vs flat on a test set, refit on a training set. */
@@ -555,8 +732,11 @@ function looValidation(comps: SnapshotProtocol[], asOf: string, model: ModelCons
 }
 
 /**
- * The full validation: leave-one-out, walk-forward by listing date, and the
- * share of comps whose true market cap lands inside their bootstrap P10-P90 band.
+ * The full validation: leave-one-out, walk-forward by listing date,
+ * size-stratified 5-fold and leave-one-category-out (the two extra splits a
+ * new category or a new size band would face), the ablation table that gates
+ * every value term, and the share of comps whose true market cap lands
+ * inside their bootstrap P10-P90 band.
  */
 export function validateCurve(snapshot: Snapshot, model: ModelConstants = MODEL): Validation {
   const comps = compsOf(snapshot);
@@ -566,6 +746,53 @@ export function validateCurve(snapshot: Snapshot, model: ModelConstants = MODEL)
   const train = dated.slice(0, half);
   const test = dated.slice(half);
   const wf = validationTest(train, test, snapshot.as_of, model);
+  // Size-stratified 5-fold: sort by TVL, deal round-robin, so every fold
+  // holds the same size mix and no fold is all small or all large.
+  const bySize = [...comps].sort((a, b) => a.tvl_usd - b.tvl_usd);
+  const sizeFolds: SnapshotProtocol[][] = [[], [], [], [], []];
+  bySize.forEach((p, i) => sizeFolds[i % 5]!.push(p));
+  const sizePreds: number[] = [];
+  const sizeActual: number[] = [];
+  for (let k = 0; k < 5; k++) {
+    const te = sizeFolds[k]!;
+    const tr = sizeFolds.flatMap((f, j) => (j === k ? [] : f));
+    const c = fitCurve(tr, model);
+    for (const p of te) {
+      sizePreds.push(Math.pow(10, curveLogValue(p, c)));
+      sizeActual.push(p.mcap_usd!);
+    }
+  }
+  const sizeMiss = sizePreds.map((pv, i) => missMultiple(pv, sizeActual[i]!)).sort((a, b) => a - b);
+  const size_stratified: SplitValidation = {
+    n: comps.length,
+    curve_median_miss: Math.round((median(sizeMiss) ?? 0) * 100) / 100,
+    curve_within_3x: Math.round((sizeMiss.filter((m) => m <= 3).length / sizeMiss.length) * 100) / 100,
+    spearman: Math.round(spearman(sizePreds, sizeActual) * 100) / 100,
+    curve_mean_log_miss: Math.round(meanLogMiss(sizePreds, sizeActual) * 1e4) / 1e4,
+  };
+  // Leave-one-category-out: predict each category from the other categories
+  // only, so the curve cannot lean on a category's own premium.
+  const cats = [...new Set(comps.map((p) => p.category ?? ''))];
+  const locoPreds: number[] = [];
+  const locoActual: number[] = [];
+  for (const cat of cats) {
+    const te = comps.filter((p) => (p.category ?? '') === cat);
+    const tr = comps.filter((p) => (p.category ?? '') !== cat);
+    const c = fitCurve(tr, model);
+    for (const p of te) {
+      locoPreds.push(Math.pow(10, curveLogValue(p, c)));
+      locoActual.push(p.mcap_usd!);
+    }
+  }
+  const locoMiss = locoPreds.map((pv, i) => missMultiple(pv, locoActual[i]!)).sort((a, b) => a - b);
+  const leave_one_category_out: SplitValidation = {
+    n: comps.length,
+    curve_median_miss: Math.round((median(locoMiss) ?? 0) * 100) / 100,
+    curve_within_3x: Math.round((locoMiss.filter((m) => m <= 3).length / locoMiss.length) * 100) / 100,
+    spearman: Math.round(spearman(locoPreds, locoActual) * 100) / 100,
+    curve_mean_log_miss: Math.round(meanLogMiss(locoPreds, locoActual) * 1e4) / 1e4,
+  };
+  const ablation = ablationValidation(comps, snapshot.as_of, model);
   const curve = fitCurve(comps, model);
   // Range holds: resample the comps, refit, and ask how often the truth lands
   // inside the protocol's own P10-P90 band. Each draw is a predictive draw:
@@ -594,6 +821,9 @@ export function validateCurve(snapshot: Snapshot, model: ModelConstants = MODEL)
   return {
     loo,
     walk_forward: { ...wf, train: train.length, test: test.length },
+    size_stratified,
+    leave_one_category_out,
+    ablation,
     range_holds_pct: Math.round((holds / comps.length) * 100) / 100,
     refits: model.bootstrap_refits,
   };
@@ -634,17 +864,23 @@ function categoryStats(rows: SnapshotProtocol[]): CategoryStats {
   return { median, rate };
 }
 
-/** The launch-odds features: log TVL, clipped 7-day growth, age in years,
- * chain count, log TVL relative to the category median (a big fish in a small
- * pond launches more often), the category's token rate, shrunk toward the
- * global rate (categories where tokens are the norm launch more often), and
- * whether Ethereum is the protocol's first-listed chain (in this snapshot
- * 63% of Ethereum-first protocols already carry a token, against 50% of the
- * rest). Age enters in years, not log-years: the share already carrying a
- * token rises about linearly with age (33% under a year old, 79% past three
- * years), so log-age compresses exactly the end that matters. Every feature
- * is a function of the snapshot row and its category's training-set stats;
- * nothing names a protocol. */
+/** The launch-odds features (17). The v5 eight are first: log TVL, clipped
+ * 7-day growth, age in years, chain count, log TVL relative to the category
+ * median (a big fish in a small pond launches more often), the category's
+ * token rate, shrunk toward the global rate (categories where tokens are the
+ * norm launch more often), and whether Ethereum is the protocol's
+ * first-listed chain. radar-6 adds three that each won on BOTH cross-validation
+ * protocols (slug-hash 5-fold and 10 seeds of random 5-fold, accuracy, Brier
+ * and AUC all moving the same way): two age buckets (past three years, under
+ * a year — the token rate rises about linearly with age, 33% under a year
+ * old, 79% past three years, but the rise is not a straight line), the
+ * age-by-size interaction (old and large behaves differently from old and
+ * small), and first-chain dummies for Solana, Binance, Arbitrum, Base,
+ * Bitcoin and Hyperliquid L1 (first-chain matters beyond Ethereum: in this
+ * snapshot Solana-first protocols token at a different rate again). Age
+ * enters in years, not log-years: log-age compresses exactly the end that
+ * matters. Every feature is a function of the snapshot row and its
+ * category's training-set stats; nothing names a protocol. */
 function oddsFeatures(p: SnapshotProtocol, asOf: string, stats: CategoryStats): number[] {
   const age = ageDays(asOf, p.listed_at);
   const ageYears = (age ?? 365) / 365;
@@ -653,7 +889,36 @@ function oddsFeatures(p: SnapshotProtocol, asOf: string, stats: CategoryStats): 
   const rel = Math.log10(Math.max(p.tvl_usd, 1) / Math.max(stats.median.get(cat) ?? p.tvl_usd, 1));
   const rate = stats.rate.get(cat) ?? 0;
   const ethFirst = p.chains.length > 0 && p.chains[0] === 'Ethereum' ? 1 : 0;
-  return [1, (Math.log10(Math.max(p.tvl_usd, 1)) - 8) / 1.5, growth / 25, ageYears - 1, (p.chains.length - 1) / 3, rel, rate, ethFirst];
+  const logTvl = (Math.log10(Math.max(p.tvl_usd, 1)) - 8) / 1.5;
+  const first = p.chains.length > 0 ? p.chains[0]! : '';
+  const chainFirst = ['Solana', 'Binance', 'Arbitrum', 'Base', 'Bitcoin', 'Hyperliquid L1'].map((c) => (first === c ? 1 : 0));
+  return [1, logTvl, growth / 25, ageYears - 1, (p.chains.length - 1) / 3, rel, rate, ethFirst, ageYears > 3 ? 1 : 0, ageYears < 1 ? 1 : 0, (ageYears - 1) * logTvl, ...chainFirst];
+}
+
+/** AUC by Mann-Whitney with tie-averaged ranks: the ranking quality of the
+ * out-of-fold scores, independent of the 0.5 threshold. */
+function aucFromScores(scores: { s: number; y: number }[]): number {
+  const sorted = [...scores].sort((a, b) => a.s - b.s);
+  const ranks = new Array<number>(sorted.length).fill(0);
+  let i = 0;
+  while (i < sorted.length) {
+    let j = i;
+    while (j + 1 < sorted.length && sorted[j + 1]!.s === sorted[i]!.s) j++;
+    const avg = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) ranks[k] = avg;
+    i = j + 1;
+  }
+  let sumPos = 0;
+  let nPos = 0;
+  let nNeg = 0;
+  for (let k = 0; k < sorted.length; k++) {
+    if (sorted[k]!.y === 1) {
+      sumPos += ranks[k]!;
+      nPos++;
+    } else nNeg++;
+  }
+  if (nPos === 0 || nNeg === 0) return 0.5;
+  return Math.round(((sumPos - (nPos * (nPos + 1)) / 2) / (nPos * nNeg)) * 100) / 100;
 }
 
 /** Whether a protocol's record carries a token in any form. */
@@ -667,30 +932,35 @@ function sigmoid(z: number): number {
 }
 
 /** Logistic regression by plain gradient descent: fixed iterations, fixed rate, deterministic.
- * The category stats come from the same rows, so a held-out fold's stats never see the fold. */
-function trainLogistic(rows: SnapshotProtocol[], asOf: string, iters = 2000, lr = 0.15): { weights: number[]; stats: CategoryStats } {
+ * The category stats come from the same rows, so a held-out fold's stats never see the fold.
+ * The L2 penalty comes from the model constants (0.005 in radar-6). */
+function trainLogistic(rows: SnapshotProtocol[], asOf: string, iters = 2000, lr = 0.15, model: ModelConstants = MODEL): { weights: number[]; stats: CategoryStats } {
   const stats = categoryStats(rows);
   const xs = rows.map((p) => oddsFeatures(p, asOf, stats));
   const ys = rows.map((p) => (hasToken(p) ? 1 : 0));
-  const w = [0, 0, 0, 0, 0, 0, 0, 0];
+  const dim = xs[0]!.length;
+  const w = new Array<number>(dim).fill(0);
   for (let t = 0; t < iters; t++) {
-    const grad = [0, 0, 0, 0, 0, 0, 0, 0];
+    const grad = new Array<number>(dim).fill(0);
     for (let i = 0; i < xs.length; i++) {
       const xi = xs[i]!;
       let z = 0;
-      for (let j = 0; j < 8; j++) z += w[j]! * xi[j]!;
+      for (let j = 0; j < dim; j++) z += w[j]! * xi[j]!;
       const pr = sigmoid(z);
-      for (let j = 0; j < 8; j++) grad[j]! += (pr - ys[i]!) * xi[j]!;
+      for (let j = 0; j < dim; j++) grad[j]! += (pr - ys[i]!) * xi[j]!;
     }
-    for (let j = 0; j < 8; j++) {
-      grad[j] = grad[j]! / xs.length + 0.01 * w[j]!;
+    for (let j = 0; j < dim; j++) {
+      grad[j] = grad[j]! / xs.length + model.odds_l2 * w[j]!;
       w[j] = w[j]! - lr * grad[j]!;
     }
   }
   return { weights: w, stats };
 }
 
-/** The classifier's held-out accuracy: 5 folds split by slug hash, against the base rate. */
+/** The classifier's held-out accuracy, Brier score, AUC and calibration:
+ * 5 folds split by slug hash, against the base rate. Every fold's scores
+ * are kept out-of-fold, so the Brier score, the AUC and the calibration
+ * bins are all honest held-out numbers, not in-sample fits. */
 export function trainOdds(snapshot: Snapshot, model: ModelConstants = MODEL): Classifier {
   const rows = snapshot.protocols.filter((p) => p.tvl_usd > 0);
   const folds: SnapshotProtocol[][] = [[], [], [], [], []];
@@ -702,27 +972,43 @@ export function trainOdds(snapshot: Snapshot, model: ModelConstants = MODEL): Cl
   let correct = 0;
   let total = 0;
   let baseCorrect = 0;
+  const oof: { s: number; y: number }[] = [];
   for (let k = 0; k < 5; k++) {
     const test = folds[k]!;
     const train: SnapshotProtocol[] = [];
     for (let j = 0; j < 5; j++) if (j !== k) train.push(...folds[j]!);
-    const { weights: w, stats } = trainLogistic(train, snapshot.as_of);
+    const { weights: w, stats } = trainLogistic(train, snapshot.as_of, 2000, 0.15, model);
     let ones = 0;
     for (const p of test) {
       const xi = oddsFeatures(p, snapshot.as_of, stats);
       let z = 0;
-      for (let j = 0; j < 8; j++) z += w[j]! * xi[j]!;
-      if ((sigmoid(z) >= 0.5) === hasToken(p)) correct++;
+      for (let j = 0; j < xi.length; j++) z += w[j]! * xi[j]!;
+      const s = sigmoid(z);
+      oof.push({ s, y: hasToken(p) ? 1 : 0 });
+      if ((s >= 0.5) === hasToken(p)) correct++;
       if (hasToken(p)) ones++;
     }
     baseCorrect += Math.max(ones, test.length - ones);
     total += test.length;
   }
-  const { weights: w, stats } = trainLogistic(rows, snapshot.as_of);
+  const brier = Math.round((oof.reduce((a, o) => a + (o.s - o.y) * (o.s - o.y), 0) / Math.max(oof.length, 1)) * 1e4) / 1e4;
+  const calibration: { n: number; predicted: number; actual: number }[] = [];
+  for (let b = 0; b < 5; b++) {
+    const bin = oof.filter((o) => o.s >= b / 5 && (b === 4 ? o.s <= 1 : o.s < (b + 1) / 5));
+    calibration.push({
+      n: bin.length,
+      predicted: bin.length === 0 ? 0 : Math.round((bin.reduce((a, o) => a + o.s, 0) / bin.length) * 100) / 100,
+      actual: bin.length === 0 ? 0 : Math.round((bin.reduce((a, o) => a + o.y, 0) / bin.length) * 100) / 100,
+    });
+  }
+  const { weights: w, stats } = trainLogistic(rows, snapshot.as_of, 2000, 0.15, model);
   return {
     accuracy_pct: Math.round((correct / total) * 100) / 100,
     base_rate_pct: Math.round((baseCorrect / total) * 100) / 100,
     folds: 5,
+    brier,
+    auc: aucFromScores(oof),
+    calibration,
     weights: w.map((x) => Math.round(x * 1e4) / 1e4),
     cat_median: Object.fromEntries(stats.median),
     cat_rate: Object.fromEntries(stats.rate),
@@ -733,7 +1019,7 @@ export function trainOdds(snapshot: Snapshot, model: ModelConstants = MODEL): Cl
 export function oddsFor(p: SnapshotProtocol, asOf: string, w: number[], stats: CategoryStats): number {
   const xi = oddsFeatures(p, asOf, stats);
   let z = 0;
-  for (let j = 0; j < 8; j++) z += w[j]! * xi[j]!;
+  for (let j = 0; j < xi.length; j++) z += w[j]! * xi[j]!;
   return Math.round(sigmoid(z) * 100) / 100;
 }
 

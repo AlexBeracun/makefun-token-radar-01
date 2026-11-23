@@ -1,6 +1,7 @@
-// Retake the 3 Token Radar screenshots from the v4 out/ build.
+// Retake the 4 Token Radar screenshots from the v6 out/ build.
 // Board (tall viewport, ~17 rows), detail (tall viewport, all 7 steps),
-// filtered (MARGINAL verdict chip — a visibly different set from the board).
+// filtered (MARGINAL verdict chip — a visibly different set from the board),
+// method (the evidence panel: scatter, validation, ablation, calibration).
 import { chromium } from 'playwright-core';
 import http from 'node:http';
 import { createReadStream, existsSync, statSync } from 'node:fs';
@@ -26,7 +27,7 @@ const browser = await chromium.launch({
   args: ['--no-sandbox'],
 });
 
-const quality = Number(process.argv[2] ?? 90);
+const quality = Number(process.argv[2] ?? 85);
 
 // 1-board: tall viewport so the ranking breadth shows.
 {
@@ -58,6 +59,16 @@ const quality = Number(process.argv[2] ?? 90);
   await page.click('button.chip:has-text("MARGINAL")');
   await page.waitForTimeout(500);
   await page.screenshot({ path: join(SHOTS, '3-filtered.jpg'), type: 'jpeg', quality });
+  await page.close();
+}
+
+// 4-method: the evidence panel — scatter, validation splits, ablation, calibration.
+{
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1600 } });
+  await page.goto(url, { waitUntil: 'networkidle' });
+  await page.waitForSelector('#method', { timeout: 15000 });
+  await page.waitForTimeout(300);
+  await page.locator('#method').screenshot({ path: join(SHOTS, '4-method.jpg'), type: 'jpeg', quality });
   await page.close();
 }
 

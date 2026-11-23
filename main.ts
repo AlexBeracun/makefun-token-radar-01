@@ -1,10 +1,18 @@
-// Token Radar v5 entry (Node 22, standard library only).
-// v5 changes only the launch-odds classifier: age enters in years (not
-// log-years — the token rate rises about linearly with age in this snapshot)
-// plus whether Ethereum is the protocol's first-listed chain. Held-out
-// accuracy 64% → 68% on the same 5-fold protocol; the value curve is
-// unchanged (richer fits, comp-set cleaning and shrink sweeps were tested on
-// the same leave-one-out / walk-forward protocol and did not beat it).
+// Token Radar v6 entry (Node 22, standard library only).
+// v6 changes the value curve and the launch-odds classifier. The curve is
+// now a ridge fit — log10(mcap) on log10(TVL) with one dummy per category,
+// fitted jointly (λ = 24 on the dummies) — replacing the two-stage
+// mean-residual premium, and the growth/maturity/breadth multipliers are
+// dropped: each was tested alone as a value term and each raised the held-out
+// mean |log miss| on both tests (LOO and walk-forward), so the ablation gate
+// drops them. LOO median miss ×3.67 (was ×3.86), walk-forward ×2.87 (was
+// ×3.06), with two extra splits printed (size-stratified 5-fold,
+// leave-one-category-out). The odds classifier gains nine features (two age
+// buckets, the age-by-size interaction, first-chain dummies for Solana,
+// Binance, Arbitrum, Base, Bitcoin and Hyperliquid L1); held-out accuracy
+// 68% → 70% against a 57% base rate, Brier 0.200, AUC 0.75, with an
+// out-of-fold calibration table. Trees, gradient-boosting stumps, a piecewise
+// size slope and k-NN were all tested on the same protocols and lost.
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
 // scores every rankable pre-token protocol with the fitted size curve in
@@ -96,6 +104,6 @@ process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside), ${radar.farm_count} FARM verdicts\n` +
     `token radar: curve log10(mcap) = ${radar.curve.intercept} + ${radar.curve.slope} * log10(tvl) over ${radar.curve.comps} comps\n` +
     `token radar: LOO median miss x${v.loo.curve_median_miss} (${Math.round(v.loo.curve_within_3x * 100)}% within 3x, spearman ${v.loo.spearman}) vs flat x${v.loo.flat_median_miss} (${Math.round(v.loo.flat_within_3x * 100)}% within 3x)\n` +
-    `token radar: walk-forward median miss x${v.walk_forward.curve_median_miss} (${Math.round(v.walk_forward.curve_within_3x * 100)}% within 3x) vs flat x${v.walk_forward.flat_median_miss}; range holds ${Math.round(v.range_holds_pct * 100)}%; launch odds ${Math.round(radar.classifier.accuracy_pct * 100)}% vs base ${Math.round(radar.classifier.base_rate_pct * 100)}%\n` +
+    `token radar: walk-forward median miss x${v.walk_forward.curve_median_miss} (${Math.round(v.walk_forward.curve_within_3x * 100)}% within 3x) vs flat x${v.walk_forward.flat_median_miss}; size-stratified x${v.size_stratified.curve_median_miss}, leave-one-category-out x${v.leave_one_category_out.curve_median_miss}; range holds ${Math.round(v.range_holds_pct * 100)}%; launch odds ${Math.round(radar.classifier.accuracy_pct * 100)}% vs base ${Math.round(radar.classifier.base_rate_pct * 100)}%, Brier ${radar.classifier.brier}, AUC ${radar.classifier.auc}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
